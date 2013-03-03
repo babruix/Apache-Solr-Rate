@@ -1,0 +1,158 @@
+<?php
+/**
+ * @file
+ * The integration between Solr and Rate modules.
+ *
+ * Provides ability to boost search using rate voting results
+ */
+
+/**
+ * Implements of hook_enable().
+ */
+function apachesolr_rate_enable() {
+  drupal_set_message(t('The Apache Solr rate integration module will take effect as nodes when votes are indexed or re-indexed.'));
+}
+
+/**
+ * Implements hook_FORM_ID_alter().
+ *
+ * Let admins bias result order using votingapi score.
+ */
+function apachesolr_rate_form_apachesolr_search_bias_form_alter(&$form, &$form_state) {
+  $env_id = apachesolr_default_environment();
+  $vote_settings = apachesolr_environment_variable_get($env_id, 'apachesolr_rate_boost', '0:0');
+
+  $options = array(
+    '10:3000.0' => '21.0',
+    '10:2500.0' => '13.0',
+    '10:2000.0' => '8.0',
+    '8:1000.0' => '5.0',
+    '8:700.0' => '3.0',
+    '8:500.0' => '2.0',
+    '4:300.0' => '1.0',
+    '4:200.0' => '0.8',
+    '4:150.0' => '0.5',
+    '2:150.0' => '0.3',
+    '2:100.0' => '0.2',
+    '1:100.0' => '0.1',
+    '0:0' => t('Ignore'),
+  );
+
+  $form['result_bias']['apachesolr_rate_boost'] = array(
+    '#type' => 'select',
+    '#options' => $options,
+    '#title' => t('Higher votes bias'),
+    '#default_value' => $vote_settings,
+    '#description' => t('This setting will change the result scoring so that nodes with better average vote scores may appear before those with higher keyword matching.'),
+    '#weight' => -2,
+  );
+  $form['actions']['submit']['#submit'][] = 'apachesolr_rate_boost_bias_form_submit';
+}
+
+/**
+ * Submit handler to save apache solr rate boost value
+ */
+function apachesolr_rate_boost_bias_form_submit(&$form, &$form_state) {
+  $boost_rate_value = $form_state['values']['apachesolr_rate_boost'];
+  apachesolr_environment_variable_set($form['#env_id'], 'apachesolr_rate_boost', $boost_rate_value);
+}
+
+/**
+ * Implements hook_apachesolr_index_document_build_ENTITY_TYPE().
+ *
+ * Add the rate field to documents before sending them to Solr.
+ */
+function apachesolr_rate_apachesolr_index_document_build_node(ApacheSolrDocument $document, $entity, $env_id) {
+
+  // Get widget id
+  $widget_id = ei_apachesolr_get_default_widget_id($entity);
+
+  // Add rate results
+  $results = rate_get_results('node', $entity->nid, $widget_id);
+  // Nodes without any votes will get indexed as 0.
+  $value = (int)$results['rating'];
+
+  $document->addField('fs_rating_result', $value);
+}
+
+/**
+ * Function used to get default widget id for entity
+ * @param $entity the complete entity to process
+ * @return int id of default rate widget
+ */
+function ei_apachesolr_get_default_widget_id($entity) {
+  $widgets = rate_get_active_widgets('node', $entity->type);
+  reset($widgets);
+  $widget_id = key($widgets);
+
+  return $widget_id;
+}
+
+/**
+ * Implements hook_apachesolr_query_alter().
+ *
+ * Inject admin specified boost for voting.
+ */
+function apachesolr_rate_apachesolr_query_alter(ApachesolrViewsSolrBaseQuery $query) {
+  // Retrieve the votingapi result in the field list.
+  $query->addParam('fl', 'fs_rating_result');
+
+  // Get $total. Copied from apachesolr_search_search
+  $solr = apachesolr_get_solr();
+  $data = $solr->getLuke();
+  $total = isset($data->index->numDocs) ? $data->index->numDocs : db_result(db_query("SELECT COUNT(nid) FROM {node}"));
+
+  // Apply boost based on votes.
+  $env_id = apachesolr_default_environment();
+  $vote_settings = apachesolr_environment_variable_get($env_id, 'apachesolr_rate_boost', '0:0');
+
+  // Apply boost based on votes.
+  list($vote_steepness, $vote_boost) = explode(':', $vote_settings);
+  if ($vote_boost) {
+    $query->addParam('bf', "recip(rord(fs_rating_result),$vote_steepness,$total,$total)^$vote_boost");
+  }
+}
+
+/**
+ * Implements hook_apachesolr_query_prepare().
+ *
+ * Add votes as a sort.
+ */
+function apachesolr_rate_apachesolr_query_prepare($query) {
+  $criteria = apachesolr_rate_get_criteria();
+  $query->setAvailableSort('fs_rating_result', array(
+    'title' => $criteria['title'],
+    'default' => 'desc',
+  ));
+
+  $query->addFieldAliases(array('rating' => 'fs_rating_result'));
+}
+
+/**
+ * Implements hook_votingapi_results().
+ *
+ * When a vote's tallys are recalculated, mark the node for re-indexing.
+ */
+function apachesolr_rate_votingapi_results($cached, $entity_type, $entity_id) {
+  $criteria = apachesolr_rate_get_criteria();
+  if ($entity_type == $criteria['entity_type']) {
+    apachesolr_mark_entity('node', $entity_id);
+  }
+}
+
+/**
+ * Retrieve which tally is being used by this site as a basis for Solr sorting. See README.txt
+ *
+ * @return array
+ *   A $criteria array for use by votingapi_select_single_result_value().
+ */
+function apachesolr_rate_get_criteria() {
+  $criteria_default = array(
+    'title' => t('Rating'),
+    'entity_type' => 'node',
+    'value_type' => 'percent',
+    'function' => 'average',
+    'tag' => 'vote',
+  );
+  return variable_get('apachesolr_rate_criteria', $criteria_default);
+}
